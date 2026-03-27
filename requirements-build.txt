@@ -1,0 +1,2 @@
+# 仅用于在本机打包 exe，运行生成的程序无需安装 Python
+pyinstaller>=6.0,<8
