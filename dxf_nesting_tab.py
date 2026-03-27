@@ -22,15 +22,16 @@ def _safe_int(value: str, default: int) -> int:
 class DxfNestingTab(ttk.Frame):
     """根据 DXF 轮廓密铺排料（多种密铺 + 真实多边形绘制）。"""
 
-    _LEFT_OUT_PAD = 8
-    _LEFT_LBL_W = 9
-    _LEFT_ENT_W = 9
+    _LEFT_OUT_PAD = 6
+    # tk.Text 默认 width=80 列，会把左栏撑满；与参数区同宽对齐
+    _LEFT_TEXT_COLS = 50
 
     _PACK_MODES: list[tuple[str, str]] = [
-        (dx.PACKING_MODE_INTERLOCK_COL, "列向180°互嵌（省料）"),
         (dx.PACKING_MODE_GRID, "标准网格"),
         (dx.PACKING_MODE_COMPACT, "紧凑（凹槽互嵌）"),
         (dx.PACKING_MODE_BRICK, "交错行"),
+        (dx.PACKING_MODE_INTERLOCK_COL_ROT180, "列向180°互嵌"),
+        (dx.PACKING_MODE_INTERLOCK_COL, "列向180°旋转+镜像（省料）"),
     ]
 
     _PREVIEW_PAD_L = 56
@@ -98,24 +99,25 @@ class DxfNestingTab(ttk.Frame):
         main.pack(fill="both", expand=True)
 
         left = ttk.Frame(main, padding=(0, 0, self._LEFT_OUT_PAD, 0))
-        left.pack(side="left", fill="y")
+        left.pack(side="left", fill="y", anchor="nw")
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True)
 
-        group = ttk.LabelFrame(left, text="DXF 与参数（单位：mm）", padding=6)
-        group.pack(side="top", fill="x")
+        group = ttk.LabelFrame(left, text="DXF 与参数（单位：mm）", padding=5)
+        group.pack(side="top", fill="x", anchor="nw")
 
-        row = ttk.Frame(group)
-        row.pack(fill="x", pady=4)
-        ttk.Label(row, text="DXF", width=self._LEFT_LBL_W, anchor="w").pack(
-            side="left"
+        row_dxf = ttk.Frame(group)
+        row_dxf.pack(fill="x", pady=4)
+        row_dxf.columnconfigure(1, weight=1)
+        ttk.Label(row_dxf, text="DXF：", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        ent_dxf = ttk.Entry(row, textvariable=self.vars["dxf_path"], width=14)
-        ent_dxf.pack(side="left", fill="x", expand=True)
+        ent_dxf = ttk.Entry(row_dxf, textvariable=self.vars["dxf_path"])
+        ent_dxf.grid(row=0, column=1, sticky="ew")
         ent_dxf.bind("<FocusOut>", lambda _e: self._recalculate(), add="+")
         ent_dxf.bind("<Return>", lambda _e: self._recalculate(), add="+")
-        ttk.Button(row, text="浏览…", command=self._browse_dxf).pack(
-            side="right", padx=(6, 0)
+        ttk.Button(row_dxf, text="浏览…", command=self._browse_dxf).grid(
+            row=0, column=2, sticky="e", padx=(6, 0)
         )
 
         self._add_entry(group, "板边间隙", "gap_edge")
@@ -126,50 +128,51 @@ class DxfNestingTab(ttk.Frame):
 
         row_fb = ttk.Frame(group)
         row_fb.pack(fill="x", pady=4)
-        ttk.Label(row_fb, text="纤维°", width=self._LEFT_LBL_W, anchor="w").pack(
-            side="left"
+        row_fb.columnconfigure(2, weight=1)
+        ttk.Label(row_fb, text="旋转角度：", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        ttk.Label(row_fb, textvariable=self.vars["fiber_deg"], width=3).pack(
-            side="left", padx=(2, 0)
+        ttk.Label(row_fb, textvariable=self.vars["fiber_deg"], width=3).grid(
+            row=0, column=1, sticky="w"
         )
         ttk.Button(
             row_fb,
             text="+90°",
             command=self._fiber_add_90,
-        ).pack(side="right", padx=(4, 0))
+        ).grid(row=0, column=3, sticky="e", padx=(6, 0))
 
         row_pk = ttk.Frame(group)
         row_pk.pack(fill="x", pady=4)
-        ttk.Label(row_pk, text="密铺", width=self._LEFT_LBL_W, anchor="w").pack(
-            side="left"
+        row_pk.columnconfigure(1, weight=1)
+        ttk.Label(row_pk, text="密铺方式：", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        sub_pk = ttk.Frame(row_pk)
-        sub_pk.pack(side="left", fill="x", expand=True)
         self._packing_combo = ttk.Combobox(
-            sub_pk,
+            row_pk,
             state="readonly",
-            width=11,
+            width=8,
             values=[lab for _, lab in self._PACK_MODES],
         )
-        self._packing_combo.pack(side="left", fill="x", expand=True)
-        self._packing_combo.set(self._PACK_MODES[0][1])  # 默认：列向180°互嵌
+        self._packing_combo.grid(row=0, column=1, sticky="ew")
+        self._packing_combo.set(self._PACK_MODES[0][1])  # 默认：列向180°旋转+镜像
         self._packing_combo.bind("<<ComboboxSelected>>", self._on_packing_combo)
-        ttk.Button(sub_pk, text="下一", command=self._cycle_packing_mode).pack(
-            side="right", padx=(4, 0)
+        ttk.Button(row_pk, text="下一种", command=self._cycle_packing_mode).grid(
+            row=0, column=2, sticky="e", padx=(6, 0)
         )
 
         lower = ttk.Frame(left)
-        lower.pack(fill="both", expand=True, pady=(8, 0))
+        lower.pack(fill="y", expand=True, pady=(8, 0), anchor="nw")
         lower.rowconfigure(0, weight=1)
         lower.rowconfigure(1, weight=1)
         lower.columnconfigure(0, weight=1)
 
-        result_lf = ttk.LabelFrame(lower, text="计算结果", padding=(6, 6))
+        result_lf = ttk.LabelFrame(lower, text="计算结果", padding=(5, 5))
         result_lf.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
         result_lf.rowconfigure(0, weight=1)
         result_lf.columnconfigure(0, weight=1)
         self._dxf_result_text = tk.Text(
             result_lf,
+            width=self._LEFT_TEXT_COLS,
             height=3,
             wrap="word",
             font=("Segoe UI", 9),
@@ -185,12 +188,13 @@ class DxfNestingTab(ttk.Frame):
         self._dxf_result_text.grid(row=0, column=0, sticky="nsew")
         dxf_rsb.grid(row=0, column=1, sticky="ns")
 
-        help_lf = ttk.LabelFrame(lower, text="说明", padding=(6, 6))
+        help_lf = ttk.LabelFrame(lower, text="说明", padding=(5, 5))
         help_lf.grid(row=1, column=0, sticky="nsew")
         help_lf.rowconfigure(0, weight=1)
         help_lf.columnconfigure(0, weight=1)
         help_txt = tk.Text(
             help_lf,
+            width=self._LEFT_TEXT_COLS,
             height=3,
             wrap="word",
             font=("Segoe UI", 9),
@@ -211,7 +215,8 @@ class DxfNestingTab(ttk.Frame):
             "LINE/ARC 等散线若首尾相接会尝试拼成闭合（端点宜精确相接）。\n"
             "密铺自动优选 0°/180° 与横/纵镜像（不含 90°/270°），使单张件数最多。\n"
             "「+90°」在排样前将轮廓绕质心旋转（可连点累加）。零件间隙用等距半宽缓冲，净距不小于设定值。\n"
-            "密铺含列向互嵌、标准网格、紧凑、交错行等；预览区滚轮缩放、左键拖动、重置比例；"
+            "密铺含「列向180°旋转+镜像」「列向180°互嵌（无镜像）」、标准网格、紧凑、交错行等；"
+            "预览区滚轮缩放、左键拖动、重置比例；"
             "改数字后按 Enter 或离开输入框再计算。",
         )
         help_txt.configure(state="disabled")
@@ -256,12 +261,13 @@ class DxfNestingTab(ttk.Frame):
 
     def _add_entry(self, parent: ttk.Widget, label: str, key: str) -> None:
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=4)
-        ttk.Label(row, text=label, width=self._LEFT_LBL_W, anchor="w").pack(
-            side="left"
+        row.pack(fill="x", pady=3)
+        row.columnconfigure(1, weight=1)
+        ttk.Label(row, text=f"{label}：", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        ent = ttk.Entry(row, textvariable=self.vars[key], width=self._LEFT_ENT_W)
-        ent.pack(side="right")
+        ent = ttk.Entry(row, textvariable=self.vars[key])
+        ent.grid(row=0, column=1, sticky="ew")
         ent.bind("<FocusOut>", lambda _e: self._recalculate(), add="+")
         ent.bind("<Return>", lambda _e: self._recalculate(), add="+")
 

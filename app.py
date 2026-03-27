@@ -204,9 +204,9 @@ def tail_board_size_mm(
 class CuttingCalculatorTab(ttk.Frame):
     """密铺下料计算与预览（作为 Notebook 中的一个选项卡）。"""
 
-    _LEFT_OUT_PAD = 8
-    _LEFT_LBL_W = 9
-    _LEFT_ENT_W = 9
+    _LEFT_OUT_PAD = 6
+    # tk.Text 未指定 width 时默认为 80 列，会把整列左栏撑到极宽
+    _LEFT_TEXT_COLS = 50
 
     def __init__(self, parent: tk.Misc, **kwargs: Any) -> None:
         super().__init__(parent, **kwargs)
@@ -253,13 +253,13 @@ class CuttingCalculatorTab(ttk.Frame):
         main.pack(fill="both", expand=True)
 
         left = ttk.Frame(main, padding=(0, 0, self._LEFT_OUT_PAD, 0))
-        left.pack(side="left", fill="y")
+        left.pack(side="left", fill="y", anchor="nw")
 
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True)
 
-        group = ttk.LabelFrame(left, text="输入参数（单位：mm）", padding=6)
-        group.pack(side="top", fill="x")
+        group = ttk.LabelFrame(left, text="输入参数（单位：mm）", padding=5)
+        group.pack(side="top", fill="x", anchor="nw")
 
         self._add_entry(group, "零件宽", "part_w")
         self._add_entry(group, "零件高", "part_h")
@@ -277,17 +277,18 @@ class CuttingCalculatorTab(ttk.Frame):
         self._add_entry(group, "板材高", "sheet_h")
 
         lower = ttk.Frame(left)
-        lower.pack(fill="both", expand=True, pady=(8, 0))
+        lower.pack(fill="y", expand=True, pady=(8, 0), anchor="nw")
         lower.rowconfigure(0, weight=1)
         lower.rowconfigure(1, weight=1)
         lower.columnconfigure(0, weight=1)
 
-        result_lf = ttk.LabelFrame(lower, text="计算结果", padding=(6, 6))
+        result_lf = ttk.LabelFrame(lower, text="计算结果", padding=(5, 5))
         result_lf.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
         result_lf.rowconfigure(0, weight=1)
         result_lf.columnconfigure(0, weight=1)
         self._result_text = tk.Text(
             result_lf,
+            width=self._LEFT_TEXT_COLS,
             height=3,
             wrap="word",
             font=("Segoe UI", 9),
@@ -303,12 +304,13 @@ class CuttingCalculatorTab(ttk.Frame):
         self._result_text.grid(row=0, column=0, sticky="nsew")
         rsb.grid(row=0, column=1, sticky="ns")
 
-        help_lf = ttk.LabelFrame(lower, text="说明", padding=(6, 6))
+        help_lf = ttk.LabelFrame(lower, text="说明", padding=(5, 5))
         help_lf.grid(row=1, column=0, sticky="nsew")
         help_lf.rowconfigure(0, weight=1)
         help_lf.columnconfigure(0, weight=1)
         help_txt = tk.Text(
             help_lf,
+            width=self._LEFT_TEXT_COLS,
             height=3,
             wrap="word",
             font=("Segoe UI", 9),
@@ -377,12 +379,13 @@ class CuttingCalculatorTab(ttk.Frame):
 
     def _add_entry(self, parent: ttk.Widget, label: str, key: str) -> None:
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=4)
-        ttk.Label(row, text=label, width=self._LEFT_LBL_W, anchor="w").pack(
-            side="left"
+        row.pack(fill="x", pady=3)
+        row.columnconfigure(1, weight=1)
+        ttk.Label(row, text=f"{label}：", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
-        ent = ttk.Entry(row, textvariable=self.vars[key], width=self._LEFT_ENT_W)
-        ent.pack(side="right")
+        ent = ttk.Entry(row, textvariable=self.vars[key])
+        ent.grid(row=0, column=1, sticky="ew")
         ent.bind("<FocusOut>", lambda _e: self.recalculate(), add="+")
         ent.bind("<Return>", lambda _e: self.recalculate(), add="+")
 

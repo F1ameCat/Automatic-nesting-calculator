@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
+import threading
 from typing import Any, Optional
 
 try:
@@ -544,6 +546,28 @@ def prepare_cell(
     return cell_w, cell_h, p_draw
 
 
+def _prepare_interlock_cell(
+    poly_mm: Polygon, gap_part_mm: float
+) -> tuple[float, float, Polygon]:
+    """
+    列向互嵌专用：以轮廓真实轴对齐包络为基准，宽高各加一整份零件间隙（与「净距≥gap」的矩形格下限一致），
+    不做 buffer 外包络，避免单元虚大导致列距/行距偏松、互嵌不紧。
+    返回 (cell_w, cell_h, 平移后轮廓：包络左下角在原点)。
+    """
+    if gap_part_mm < 0:
+        raise ValueError("零件间隙不能为负数")
+    gap = float(gap_part_mm)
+    minx, miny, _, _ = poly_mm.bounds
+    p0 = translate(poly_mm, xoff=-minx, yoff=-miny)
+    bx = p0.bounds
+    if bx[0] < -1e-6 or bx[1] < -1e-6:
+        p0 = translate(p0, xoff=-bx[0], yoff=-bx[1])
+        bx = p0.bounds
+    w = bx[2] - bx[0]
+    h = bx[3] - bx[1]
+    return w + gap, h + gap, p0
+
+
 def _transform_pose(
     poly: Polygon, rot_deg: int, mirror_x: bool, mirror_y: bool
 ) -> Polygon:
@@ -598,11 +622,14 @@ def best_orientation_and_cell(
     return best_pack
 
 
-# --- 密铺模式：标准网格 / 紧凑 / 交错行 / 列向180°互嵌 ---
+# --- 密铺模式：标准网格 / 紧凑 / 交错行 / 列向互嵌（旋转+镜像 或 仅180°） ---
 PACKING_MODE_GRID = "grid"
 PACKING_MODE_COMPACT = "compact"
 PACKING_MODE_BRICK = "brick"
+# 奇数列可在「水平镜像 / 180° / 垂直镜像」中选优（实际常为 180°+镜像 组合）
 PACKING_MODE_INTERLOCK_COL = "interlock_col"
+# 奇数列仅相对偶数列做 180°，不使用镜像类奇列变体
+PACKING_MODE_INTERLOCK_COL_ROT180 = "interlock_col_rot180"
 
 _PACKING_GAP_TOL = 1e-4
 _PACKING_GRID_CHECK_RADIUS = 3
@@ -659,16 +686,61 @@ def _poly_odd_for_interlock(p0: Polygon, kind: str) -> Polygon:
     raise ValueError(f"unknown odd kind {kind!r}")
 
 
-_INTERLOCK_ODD_KINDS = ("mirx", "rot180", "miry")
-# 奇数列 Y 向连续滑动：首轮粗扫点数 + 收缩轮数（每轮在上一最优附近再密扫）
-_INTERLOCK_DY_SLIDE_PTS_FIRST = 36
-_INTERLOCK_DY_SLIDE_PTS_REFINE = 22
+# 列向互嵌：奇数列相对 p0 的变体集合
+INTERLOCK_ODD_KINDS_MIRROR = ("mirx", "rot180", "miry")
+INTERLOCK_ODD_KINDS_ROT180_ONLY = ("rot180",)
+_INTERLOCK_MAX_PARALLEL_TASKS = 24  # 2*2*2*3，进程池上限参考
+# 列向错移 dy：可接受约 1mm 级离散化；滑动步长不得小于 1mm（更细无意义且拖慢）
+_INTERLOCK_DY_STEP_MIN_MM = 1.0
+# 奇数列 Y 向滑动：首轮/细化目标点数 + 缩窗轮数（实际点数随步长≥1mm 自动变少）
+_INTERLOCK_DY_SLIDE_PTS_FIRST = 28
+_INTERLOCK_DY_SLIDE_PTS_REFINE = 16
 _INTERLOCK_DY_SLIDE_PASSES = 3
 _INTERLOCK_DY_WINDOW_SHRINK = 0.34
-_INTERLOCK_DY_MIN_HALF_WIDTH_MM = 0.015
+# 缩窗半宽至少 1mm，与步长一致
+_INTERLOCK_DY_MIN_HALF_WIDTH_MM = 1.0
 # 寻优阶段用略小邻域加速，最后对若干最优候选用标准半径复核
 _INTERLOCK_DY_SCAN_LATTICE_RADIUS = 2
-_INTERLOCK_DY_VERIFY_TOP_K = 8
+_INTERLOCK_DY_VERIFY_TOP_K = 6
+# 列向互嵌专用：列距二分搜索略疏，显著减少 translate+distance 次数（仅互嵌调用）
+_INTERLOCK_MIN_HX_SAMPLES = 96
+_INTERLOCK_MIN_HX_BINARY = 28
+
+# 列向互嵌多进程池：复用工作进程，避免每次排版在 Windows 上反复 spawn（开销极大）
+_interlock_executor = None
+_interlock_executor_lock = threading.Lock()
+
+
+def _shutdown_interlock_executor() -> None:
+    global _interlock_executor
+    with _interlock_executor_lock:
+        ex = _interlock_executor
+        _interlock_executor = None
+    if ex is not None:
+        ex.shutdown(wait=True)
+
+
+def _get_interlock_executor():
+    """懒创建全局 ProcessPoolExecutor；DXF_INTERLOCK_PARALLEL=0 时不使用。"""
+    global _interlock_executor
+    with _interlock_executor_lock:
+        if _interlock_executor is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+
+            nw = max(
+                1,
+                min(_INTERLOCK_MAX_PARALLEL_TASKS, (os.cpu_count() or 1)),
+            )
+            ctx = mp.get_context("spawn")
+            _interlock_executor = ProcessPoolExecutor(
+                max_workers=nw,
+                mp_context=ctx,
+            )
+    return _interlock_executor
+
+
+atexit.register(_shutdown_interlock_executor)
 
 
 def _interlock_parity_metrics(
@@ -684,11 +756,19 @@ def _interlock_parity_metrics(
     row_pitch_ch: Optional[float] = None,
 ) -> tuple[int, float, float, float, int, int]:
     """固定 dy_odd 时：邻域校验后的 (件数 n, 单元面积 cw*ch, cw, ch, cols, rows)。"""
-    cw = _min_hx_alternating_cols_dy(p0, p_odd, gap_part_mm, dy_odd)
+    cw = _min_hx_alternating_cols_dy(
+        p0,
+        p_odd,
+        gap_part_mm,
+        dy_odd,
+        samples=_INTERLOCK_MIN_HX_SAMPLES,
+        binary_steps=_INTERLOCK_MIN_HX_BINARY,
+    )
     if row_pitch_ch is not None:
         ch = float(row_pitch_ch)
     else:
         ch = _min_row_pitch_pair(p0, p_odd, gap_part_mm)
+    cw0, ch0 = cw, ch
     cap_cw = max(
         bbox_cw * 2,
         p0.bounds[2] + p_odd.bounds[2] + gap_part_mm * 3,
@@ -708,8 +788,22 @@ def _interlock_parity_metrics(
         dy_odd,
         lattice_radius=lattice_radius,
     )
+    cw, ch = _tighten_parity_cw_ch(
+        p0,
+        p_odd,
+        gap_part_mm,
+        dy_odd,
+        lattice_radius,
+        cw0,
+        ch0,
+        cw,
+        ch,
+    )
     cols, rows = _count_cols_rows_parity(
         p0, p_odd, inner_w, inner_h, cw, ch, dy_odd
+    )
+    cols, rows = _parity_shrink_count_if_union_overflow(
+        inner_w, inner_h, cols, rows, cw, ch, p0, p_odd, dy_odd
     )
     n = cols * rows
     return n, cw * ch, cw, ch, cols, rows
@@ -724,6 +818,41 @@ def _dy_odd_search_bounds(p0: Polygon, p_odd: Polygon, gap_mm: float) -> tuple[f
     return -margin, margin
 
 
+def _interlock_dy_slide_positions(lo: float, hi: float, npts: int) -> list[float]:
+    """
+    在 [lo, hi] 上生成 dy 采样点；相邻点间距至少 _INTERLOCK_DY_STEP_MIN_MM，
+    并保证包含两端（在容差内）。
+    """
+    lo = float(lo)
+    hi = float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    w = hi - lo
+    st_min = float(_INTERLOCK_DY_STEP_MIN_MM)
+    if w <= 1e-12:
+        return [round(lo, 6)]
+    denom = max(int(npts) - 1, 1)
+    step = max(w / denom, st_min)
+    seq: list[float] = []
+    x = lo
+    guard = 0
+    while x <= hi + 1e-9 and guard < 60000:
+        seq.append(round(x, 6))
+        x += step
+        guard += 1
+    if not seq:
+        return [round(lo, 6)]
+    if abs(seq[-1] - hi) > 1e-3:
+        seq.append(round(hi, 6))
+    # 去重（近重合点）
+    seq.sort()
+    out: list[float] = []
+    for v in seq:
+        if not out or abs(v - out[-1]) > 1e-6:
+            out.append(v)
+    return out
+
+
 def _best_dy_odd_continuous(
     p0: Polygon,
     p_odd: Polygon,
@@ -734,7 +863,7 @@ def _best_dy_odd_continuous(
     bbox_ch: float,
 ) -> tuple[float, int, float, float, float, int, int]:
     """
-    在 [lo,hi] 上多轮缩窗 + 密采样，对 dy 做连续意义上的寻优：
+    在 [lo,hi] 上多轮缩窗 + 采样，对 dy 寻优（相邻采样点间距至少 _INTERLOCK_DY_STEP_MIN_MM，默认 1mm）。
     主目标单张件数 n，次目标单元面积 cw*ch。
     寻优阶段用较小邻域半径加速；结束后对若干最优 dy 用标准邻域复核，避免漏检远处碰撞。
     """
@@ -763,9 +892,7 @@ def _best_dy_odd_continuous(
             if pass_i == 0
             else _INTERLOCK_DY_SLIDE_PTS_REFINE
         )
-        step = width / max(npts - 1, 1)
-        for k in range(npts):
-            dy = lo + k * step
+        for dy in _interlock_dy_slide_positions(lo, hi, npts):
             n, cell_a, cw, ch, cols, rows = _interlock_parity_metrics(
                 p0,
                 p_odd,
@@ -793,9 +920,10 @@ def _best_dy_odd_continuous(
         lo = max(orig_lo, best_dy - half)
         hi = min(orig_hi, best_dy + half)
 
+    merge_eps = max(float(_INTERLOCK_DY_STEP_MIN_MM) * 0.999, 1e-3)
     seen_dy: list[float] = []
     for _n_s, _a_s, dy_s in top_pool:
-        if any(abs(dy_s - prev) < 0.08 for prev in seen_dy):
+        if any(abs(dy_s - prev) < merge_eps for prev in seen_dy):
             continue
         seen_dy.append(dy_s)
 
@@ -846,7 +974,8 @@ def _min_hx_alternating_cols_dy(
     p_odd: Polygon,
     gap_mm: float,
     dy_odd: float,
-    samples: int = 160,
+    samples: int = 120,
+    binary_steps: int = 36,
 ) -> float:
     """偶数列 p0、奇数列 p_odd 且奇数列相对行基准下移 dy_odd 时，最小列距。"""
     w0 = p0.bounds[2] - p0.bounds[0]
@@ -865,7 +994,8 @@ def _min_hx_alternating_cols_dy(
     step = (hi - lo) / max(n - 1, 1)
     lo2 = max(lo, best - step * 2.0)
     hi2 = best
-    for _ in range(44):
+    nb = max(binary_steps, 8)
+    for _ in range(nb):
         mid = (lo2 + hi2) / 2.0
         q = translate(p_odd, xoff=mid, yoff=dy_odd)
         if _gap_satisfied(p0, q, gap_mm):
@@ -927,6 +1057,123 @@ def _grow_until_parity_lattice_ok(
         ):
             return cw, ch
     return cap_cw, cap_ch
+
+
+def _tighten_parity_cw_ch(
+    p0: Polygon,
+    p_odd: Polygon,
+    gap_mm: float,
+    dy_odd: float,
+    lattice_radius: int,
+    cw0: float,
+    ch0: float,
+    cw1: float,
+    ch1: float,
+) -> tuple[float, float]:
+    """
+    grow 后 cw/ch 往往偏大；在仍满足邻域间隙的前提下交替二分缩小列距与行距，使互嵌更紧。
+    """
+    cw, ch = cw1, ch1
+    if not _parity_col_lattice_multi_ok(
+        p0, p_odd, cw, ch, gap_mm, lattice_radius, dy_odd
+    ):
+        return cw1, ch1
+    tol = 0.05
+    steps = 28
+    for _ in range(4):
+        lo, hi = cw0, cw
+        if hi > lo + tol:
+            for __ in range(steps):
+                if hi - lo < tol:
+                    break
+                mid = (lo + hi) / 2.0
+                if _parity_col_lattice_multi_ok(
+                    p0, p_odd, mid, ch, gap_mm, lattice_radius, dy_odd
+                ):
+                    hi = mid
+                else:
+                    lo = mid
+            cw = hi
+        lo, hi = ch0, ch
+        if hi > lo + tol:
+            for __ in range(steps):
+                if hi - lo < tol:
+                    break
+                mid = (lo + hi) / 2.0
+                if _parity_col_lattice_multi_ok(
+                    p0, p_odd, cw, mid, gap_mm, lattice_radius, dy_odd
+                ):
+                    hi = mid
+                else:
+                    lo = mid
+            ch = hi
+    return cw, ch
+
+
+def _parity_true_aabb(
+    cols: int,
+    rows: int,
+    cw: float,
+    ch: float,
+    p0: Polygon,
+    p_odd: Polygon,
+    dy_odd: float,
+) -> tuple[float, float, float, float]:
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    for c in range(cols):
+        for r in range(rows):
+            p = _poly_at_grid_parity(p0, p_odd, c, r, cw, ch, dy_odd)
+            b = p.bounds
+            minx = min(minx, b[0])
+            miny = min(miny, b[1])
+            maxx = max(maxx, b[2])
+            maxy = max(maxy, b[3])
+    return minx, miny, maxx, maxy
+
+
+def _parity_shrink_count_if_union_overflow(
+    inner_w: float,
+    inner_h: float,
+    cols: int,
+    rows: int,
+    cw: float,
+    ch: float,
+    p0: Polygon,
+    p_odd: Polygon,
+    dy_odd: float,
+    eps_mm: float = 1.0,
+) -> tuple[int, int]:
+    """用真实轮廓并集轴对齐包络校验；略大于解析 footprint 时回退件数，避免预览/出图越界。"""
+    if cols <= 0 or rows <= 0:
+        return cols, rows
+    eps = float(eps_mm)
+    guard = 0
+    while guard < (cols + rows) * 4 + 8:
+        guard += 1
+        minx, miny, maxx, maxy = _parity_true_aabb(
+            cols, rows, cw, ch, p0, p_odd, dy_odd
+        )
+        if (
+            maxx <= inner_w + eps
+            and maxy <= inner_h + eps
+            and minx >= -eps
+            and miny >= -eps
+        ):
+            return cols, rows
+        if rows <= 1 and cols <= 1:
+            return cols, rows
+        over_w = maxx - inner_w
+        over_h = maxy - inner_h
+        if over_h >= over_w and rows > 1:
+            rows -= 1
+        elif cols > 1:
+            cols -= 1
+        elif rows > 1:
+            rows -= 1
+        else:
+            break
+    return max(0, cols), max(0, rows)
 
 
 def _footprint_parity_grid_dy(
@@ -991,7 +1238,7 @@ def _interlock_col_combo_worker(
     task: tuple[str, float, float, float, int, bool, bool, str],
 ) -> tuple[tuple[int, float], tuple[int, bool, bool, float, float, Polygon, Polygon, int, int, float, str]]:
     """
-    子进程任务：对单一 (姿态, 奇列变体) 做 Y 向连续寻优。
+    子进程任务：对单一 (姿态, 奇列变体) 做 Y 向寻优（步长≥1mm）。
     入参为 (poly_wkt, gap_part_mm, inner_w, inner_h, deg, mx, my, odd_kind)。
     返回 (排序键 (n, -cell_area), 与 best_orientation_and_cell_interlock_cols 相同的 payload 元组)。
     """
@@ -1009,7 +1256,7 @@ def _interlock_col_combo_worker(
     ) = task
     poly_mm = shapely_wkt.loads(poly_wkt)
     pr = _transform_pose(poly_mm, deg, mx, my)
-    bbox_cw, bbox_ch, p0 = prepare_cell(pr, gap_part_mm)
+    bbox_cw, bbox_ch, p0 = _prepare_interlock_cell(pr, gap_part_mm)
     p_odd = _poly_odd_for_interlock(p0, odd_kind)
     dy_odd, n, cell_a, cw, ch, cols, rows = _best_dy_odd_continuous(
         p0,
@@ -1042,13 +1289,19 @@ def best_orientation_and_cell_interlock_cols(
     gap_part_mm: float,
     inner_w: float,
     inner_h: float,
+    *,
+    odd_kinds: tuple[str, ...] = INTERLOCK_ODD_KINDS_MIRROR,
 ) -> tuple[int, bool, bool, float, float, Polygon, Polygon, int, int, float, str]:
     """
-    相邻列交替：偶数列基准件 p0，奇数列在「水平镜像 / 180° / 竖直镜像」中选优；
-    奇数列相对偶数列的竖直错移 dy 在宽区间内多轮缩窗密采样连续寻优（主：件数，次：单元面积）。
+    相邻列交替：偶数列基准件 p0，奇数列在 odd_kinds 指定变体中选优
+    （默认可含水平镜像 / 180° / 垂直镜像；仅 180° 互嵌时传入 INTERLOCK_ODD_KINDS_ROT180_ONLY）。
+    奇数列竖直错移 dy 多轮缩窗采样（步长≥1mm；主：件数，次：单元面积）。
     返回 (rot_deg, mirror_x, mirror_y, cell_w, cell_h, p0_draw, p_odd_draw, cols, rows, dy_odd, odd_kind)。
     """
     from shapely import wkt as shapely_wkt
+
+    if not odd_kinds:
+        raise ValueError("odd_kinds 不能为空")
 
     poly_wkt = shapely_wkt.dumps(poly_mm)
     tasks: list[tuple[str, float, float, float, int, bool, bool, str]] = [
@@ -1056,7 +1309,7 @@ def best_orientation_and_cell_interlock_cols(
         for deg in (0, 180)
         for mx in (False, True)
         for my in (False, True)
-        for odd_kind in _INTERLOCK_ODD_KINDS
+        for odd_kind in odd_kinds
     ]
 
     env_par = os.environ.get("DXF_INTERLOCK_PARALLEL", "1").strip().lower()
@@ -1067,13 +1320,8 @@ def best_orientation_and_cell_interlock_cols(
     ] = []
     if use_parallel and len(tasks) > 2:
         try:
-            import multiprocessing as mp
-            from concurrent.futures import ProcessPoolExecutor
-
-            workers = max(1, min(len(tasks), (os.cpu_count() or 4)))
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-                results = list(ex.map(_interlock_col_combo_worker, tasks, chunksize=1))
+            ex = _get_interlock_executor()
+            results = list(ex.map(_interlock_col_combo_worker, tasks, chunksize=1))
         except Exception:
             results = []
 
@@ -1427,15 +1675,49 @@ def layout_dxf_packing(
     if m == PACKING_MODE_INTERLOCK_COL:
         deg, mx, my, cw, ch, p0, p_odd, cols, rows, dy_odd, odd_kind = (
             best_orientation_and_cell_interlock_cols(
-                poly_mm, gap_part_mm, inner_w, inner_h
+                poly_mm,
+                gap_part_mm,
+                inner_w,
+                inner_h,
+                odd_kinds=INTERLOCK_ODD_KINDS_MIRROR,
             )
         )
         w_odd = shapely_wkt.dumps(p_odd)
         kcn = _kind_cn.get(odd_kind, odd_kind)
         dy_note = f"；列向错移 {dy_odd:.2f} mm" if abs(dy_odd) > 1e-6 else ""
         hint = (
-            f"列向互嵌：奇数列相对偶数列为「{kcn}」"
-            f"{dy_note}（奇数列 Y 连续寻优，邻域间隙校验）"
+            f"列向180°旋转+镜像：奇数列相对偶数列为「{kcn}」"
+            f"{dy_note}（奇数列 Y 向步长≥1mm 寻优，邻域间隙校验）"
+        )
+        return (
+            deg,
+            cw,
+            ch,
+            p0,
+            cols,
+            rows,
+            0.0,
+            hint,
+            mx,
+            my,
+            w_odd,
+            float(dy_odd),
+        )
+    if m == PACKING_MODE_INTERLOCK_COL_ROT180:
+        deg, mx, my, cw, ch, p0, p_odd, cols, rows, dy_odd, odd_kind = (
+            best_orientation_and_cell_interlock_cols(
+                poly_mm,
+                gap_part_mm,
+                inner_w,
+                inner_h,
+                odd_kinds=INTERLOCK_ODD_KINDS_ROT180_ONLY,
+            )
+        )
+        w_odd = shapely_wkt.dumps(p_odd)
+        dy_note = f"；列向错移 {dy_odd:.2f} mm" if abs(dy_odd) > 1e-6 else ""
+        hint = (
+            "列向180°互嵌（无镜像奇列）：奇数列相对偶数列仅 180° 姿态"
+            f"{dy_note}（Y 向步长≥1mm 寻优，邻域间隙校验）"
         )
         return (
             deg,
