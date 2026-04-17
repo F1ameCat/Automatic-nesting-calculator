@@ -525,7 +525,15 @@ class CuttingCalculatorTab(ttk.Frame):
                 total_sheets = full_count + 1
                 (last_w, last_h), (last_cols, last_rows, last_cap) = (
                     self._best_last_sheet(
-                        remain, part_w, part_h, gap_edge, gap_part
+                        remain,
+                        part_w,
+                        part_h,
+                        gap_edge,
+                        gap_part,
+                        sheet_w,
+                        sheet_h,
+                        cols,
+                        rows,
                     )
                 )
                 last_used = remain
@@ -576,20 +584,43 @@ class CuttingCalculatorTab(ttk.Frame):
         part_h: int,
         gap_edge: int,
         gap_part: int,
+        sheet_w: int,
+        sheet_h: int,
+        full_cols: int,
+        full_rows: int,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """
+        在不超过用户设定的板材 sheet_w x sheet_h 的前提下，为余量件数选列/行，
+        使尾板外包面积尽量小（原先会选单列多行导致高度超过整张板）。
+        """
         best = None
         for c in range(1, remain + 1):
-            r = math.ceil(remain / c)
+            r = int(math.ceil(remain / c))
             req_w, req_h = tail_board_size_mm(c, r, part_w, part_h, gap_edge, gap_part)
             final_w = max(req_w, MIN_SHEET_SIDE)
             final_h = max(req_h, MIN_SHEET_SIDE)
+            if final_w > sheet_w or final_h > sheet_h:
+                continue
             area = final_w * final_h
             score = (area, final_w + final_h, final_w)
             item = (score, final_w, final_h, c, r)
             if best is None or item[0] < best[0]:
                 best = item
 
-        assert best is not None
+        if best is None:
+            # 与整张目标板相同列数时，行数不超过 full_rows，外包必可落在板内
+            c0 = full_cols
+            r0 = int(math.ceil(remain / c0))
+            req_w, req_h = tail_board_size_mm(
+                c0, r0, part_w, part_h, gap_edge, gap_part
+            )
+            final_w = max(req_w, MIN_SHEET_SIDE)
+            final_h = max(req_h, MIN_SHEET_SIDE)
+            final_w = min(final_w, sheet_w)
+            final_h = min(final_h, sheet_h)
+            best_cols, best_rows = c0, r0
+            return (final_w, final_h), (best_cols, best_rows, best_cols * best_rows)
+
         _, final_w, final_h, best_cols, best_rows = best
         capacity = best_cols * best_rows
         return (final_w, final_h), (best_cols, best_rows, capacity)

@@ -103,7 +103,7 @@ class DxfNestingTab(ttk.Frame):
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True)
 
-        group = ttk.LabelFrame(left, text="DXF 与参数（单位：mm）", padding=5)
+        group = ttk.LabelFrame(left, text="DXF 与参数（单位：mm），该功能所需时间较长，请耐心等待。", padding=5)
         group.pack(side="top", fill="x", anchor="nw")
 
         row_dxf = ttk.Frame(group)
@@ -429,20 +429,24 @@ class DxfNestingTab(ttk.Frame):
         cell_h: float,
         part_wkt: str,
         gap_edge: int,
+        sheet_w: int,
+        sheet_h: int,
+        full_cols: int,
         stagger_x: float = 0.0,
         part_wkt_180: str = "",
         interlock_dy: float = 0.0,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """尾板外包不得超过用户设定的 sheet_w x sheet_h（与矩形计算器一致）。"""
         from shapely import wkt
 
         pd0 = wkt.loads(part_wkt)
         pd1 = wkt.loads(part_wkt_180) if (part_wkt_180 or "").strip() else None
-        best = None
-        for c in range(1, remain + 1):
+
+        def _tail_bounds(cols: int) -> tuple[float, float]:
             if pd1 is not None:
-                tw, th = dx.union_tail_bounds_mm_interlock_col(
+                return dx.union_tail_bounds_mm_interlock_col(
                     remain,
-                    c,
+                    cols,
                     cell_w,
                     cell_h,
                     pd0,
@@ -451,18 +455,33 @@ class DxfNestingTab(ttk.Frame):
                     stagger_x,
                     float(interlock_dy),
                 )
-            else:
-                tw, th = dx.union_tail_bounds_mm(
-                    remain, c, cell_w, cell_h, pd0, float(gap_edge), stagger_x
-                )
+            return dx.union_tail_bounds_mm(
+                remain, cols, cell_w, cell_h, pd0, float(gap_edge), stagger_x
+            )
+
+        best = None
+        for c in range(1, remain + 1):
+            tw, th = _tail_bounds(c)
             final_w = max(int(math.ceil(tw)), MIN_SHEET_SIDE)
             final_h = max(int(math.ceil(th)), MIN_SHEET_SIDE)
+            if final_w > sheet_w or final_h > sheet_h:
+                continue
             score = (final_w * final_h, final_w + final_h, final_w)
             item = (score, final_w, final_h, c)
             if best is None or item[0] < best[0]:
                 best = item
-        assert best is not None
-        _, final_w, final_h, best_cols = best
+
+        if best is None:
+            c0 = full_cols
+            tw, th = _tail_bounds(c0)
+            final_w = max(int(math.ceil(tw)), MIN_SHEET_SIDE)
+            final_h = max(int(math.ceil(th)), MIN_SHEET_SIDE)
+            final_w = min(final_w, sheet_w)
+            final_h = min(final_h, sheet_h)
+            best_cols = c0
+        else:
+            _, final_w, final_h, best_cols = best
+
         best_rows = int(math.ceil(remain / best_cols))
         capacity = best_cols * best_rows
         return (final_w, final_h), (best_cols, best_rows, capacity)
@@ -557,6 +576,9 @@ class DxfNestingTab(ttk.Frame):
                     cell_h,
                     part_wkt,
                     gap_edge,
+                    sheet_w,
+                    sheet_h,
+                    cols,
                     stagger_x,
                     part_wkt_180,
                     idy,
