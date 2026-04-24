@@ -367,6 +367,17 @@ class DxfNestingTab(ttk.Frame):
         if self._layout is not None:
             self._draw_previews()
 
+    def _cancel_dxf_busy(self, busy_win: tk.Toplevel) -> None:
+        """关闭「计算中」窗口并作废当前后台任务（不阻塞解释器，线程仍会在后台跑完但被忽略）。"""
+        if self._active_busy_win is not busy_win:
+            return
+        self._dxf_recalc_gen += 1
+        self._active_busy_win = None
+        self._destroy_busy_overlay(busy_win)
+        self.result_var.set("计算已取消。")
+        self.detail_var.set("")
+        self._sync_dxf_result_text()
+
     def _show_busy_overlay(self) -> tk.Toplevel:
         """屏幕居中显示不确定进度条；计算在后台线程时由主线程 periodic update 驱动滚动。"""
         root = self.winfo_toplevel()
@@ -374,19 +385,23 @@ class DxfNestingTab(ttk.Frame):
         win.title("请稍候")
         win.transient(root)
         win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        # 不使用 grab：否则主窗口无法点关闭，用户只能任务管理器结束进程
+        win.protocol("WM_DELETE_WINDOW", lambda: self._cancel_dxf_busy(win))
         frm = ttk.Frame(win, padding=(28, 22, 28, 24))
         frm.pack()
         ttk.Label(frm, text="计算中…", font=("Segoe UI", 11)).pack(pady=(0, 12))
         pb = ttk.Progressbar(frm, length=280, mode="indeterminate")
         pb.pack()
         pb.start(12)
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(pady=(14, 0))
+        ttk.Button(
+            btn_row,
+            text="取消",
+            command=lambda: self._cancel_dxf_busy(win),
+        ).pack()
         win._busy_pb = pb  # type: ignore[attr-defined]
         win._busy_root = root  # type: ignore[attr-defined]
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
         win.update_idletasks()
         ww = max(win.winfo_reqwidth(), 200)
         wh = max(win.winfo_reqheight(), 80)

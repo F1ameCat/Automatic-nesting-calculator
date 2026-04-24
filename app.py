@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import bisect
 import math
+import multiprocessing
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
 from dxf_nesting_tab import DxfNestingTab
+from manual_nesting_tab import ManualNestingTab
 
 
 MIN_SHEET_SIDE = 150
@@ -152,7 +154,7 @@ def neutral_layer_factor_v(k: float, sheet: Sequence[float]) -> float:
     return float(sheet[i] + t * (sheet[i + 1] - sheet[i]))
 
 
-def maximize_toplevel(win: tk.Toplevel | tk.Tk) -> None:
+def maximize_toplevel(win: Union[tk.Toplevel, tk.Tk]) -> None:
     """尽量以最大化显示主窗口（Windows 为 zoomed；其它平台尝试等价方式）。"""
     win.update_idletasks()
     try:
@@ -217,8 +219,8 @@ class CuttingCalculatorTab(ttk.Frame):
             "qty": tk.StringVar(value="685"),
             "gap_edge": tk.StringVar(value="25"),
             "gap_part": tk.StringVar(value="5"),
-            "sheet_w": tk.StringVar(value="1200"),
-            "sheet_h": tk.StringVar(value="2000"),
+            "sheet_w": tk.StringVar(value="2000"),
+            "sheet_h": tk.StringVar(value="1200"),
         }
 
         self.result_var = tk.StringVar(
@@ -754,8 +756,8 @@ class NeutralLayerFactorTab(ttk.Frame):
         self.var_t = tk.StringVar(value="")
         self.var_k = tk.StringVar(value="—")
         self.var_v = tk.StringVar(value="—")
-        self._k_cur: float | None = None
-        self._v_cur: float | None = None
+        self._k_cur: Optional[float] = None
+        self._v_cur: Optional[float] = None
 
         self._build_ui()
         self.mat_var.trace_add("write", lambda *_: self._refresh())
@@ -846,7 +848,7 @@ class NeutralLayerFactorTab(ttk.Frame):
         ttk.Entry(row, textvariable=var, width=16).pack(side="right")
 
     @staticmethod
-    def _parse_positive_float(s: str) -> float | None:
+    def _parse_positive_float(s: str) -> Optional[float]:
         s = s.strip()
         if not s:
             return None
@@ -966,6 +968,9 @@ def main() -> None:
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
+    tab_manual = ManualNestingTab(notebook, padding=0)
+    notebook.add(tab_manual, text="手动排样")
+
     tab_dxf = DxfNestingTab(notebook, padding=0)
     notebook.add(tab_dxf, text="下料（DXF轮廓）")
 
@@ -981,4 +986,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Windows 多进程 spawn 会导入本模块；打包或异常环境下配合子进程入口
+    multiprocessing.freeze_support()
     main()

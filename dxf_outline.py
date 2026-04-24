@@ -602,7 +602,7 @@ def best_orientation_and_cell(
     """
     best_n = -1
     best_area = float("inf")
-    best_pack: tuple[int, bool, bool, float, float, Polygon, int, int] | None = None
+    best_pack: Optional[tuple[int, bool, bool, float, float, Polygon, int, int]] = None
 
     for deg in (0, 180):
         for mx in (False, True):
@@ -689,7 +689,9 @@ def _poly_odd_for_interlock(p0: Polygon, kind: str) -> Polygon:
 # 列向互嵌：奇数列相对 p0 的变体集合
 INTERLOCK_ODD_KINDS_MIRROR = ("mirx", "rot180", "miry")
 INTERLOCK_ODD_KINDS_ROT180_ONLY = ("rot180",)
-_INTERLOCK_MAX_PARALLEL_TASKS = 24  # 2*2*2*3，进程池上限参考
+# 姿态组合最多 24 路任务；进程池不宜过大，否则 Windows spawn 冷启动极慢且占内存
+_INTERLOCK_MAX_PARALLEL_TASKS = 24
+_INTERLOCK_POOL_MAX_WORKERS = 8
 # 列向错移 dy：可接受约 1mm 级离散化；滑动步长不得小于 1mm（更细无意义且拖慢）
 _INTERLOCK_DY_STEP_MIN_MM = 1.0
 # 奇数列 Y 向滑动：首轮/细化目标点数 + 缩窗轮数（实际点数随步长≥1mm 自动变少）
@@ -721,7 +723,14 @@ def _shutdown_interlock_executor() -> None:
 
 
 def _get_interlock_executor():
-    """懒创建全局 ProcessPoolExecutor；DXF_INTERLOCK_PARALLEL=0 时不使用。"""
+    """
+    懒创建全局 ProcessPoolExecutor；DXF_INTERLOCK_PARALLEL=0 时不使用。
+
+    列向互嵌为大量 Shapely 几何运算，必须用多进程才能在合理时间内完成。
+    曾在 win32 上改用线程池以避免 spawn 误弹多窗，但受 GIL 影响单任务可拖到十分钟以上。
+    恢复进程池，并将并发进程数上限为 _INTERLOCK_POOL_MAX_WORKERS，减轻 Windows 冷启动负担。
+    若仍出现多主窗口，可在启动前设置环境变量 DXF_INTERLOCK_PARALLEL=0（改为单进程顺序算）。
+    """
     global _interlock_executor
     with _interlock_executor_lock:
         if _interlock_executor is None:
@@ -730,7 +739,11 @@ def _get_interlock_executor():
 
             nw = max(
                 1,
-                min(_INTERLOCK_MAX_PARALLEL_TASKS, (os.cpu_count() or 1)),
+                min(
+                    _INTERLOCK_POOL_MAX_WORKERS,
+                    _INTERLOCK_MAX_PARALLEL_TASKS,
+                    (os.cpu_count() or 1),
+                ),
             )
             ctx = mp.get_context("spawn")
             _interlock_executor = ProcessPoolExecutor(
@@ -1079,8 +1092,8 @@ def _tighten_parity_cw_ch(
     ):
         return cw1, ch1
     tol = 0.05
-    steps = 28
-    for _ in range(4):
+    steps = 18
+    for _ in range(3):
         lo, hi = cw0, cw
         if hi > lo + tol:
             for __ in range(steps):
@@ -1329,7 +1342,9 @@ def best_orientation_and_cell_interlock_cols(
         results = [_interlock_col_combo_worker(t) for t in tasks]
 
     best_key: tuple[int, float] = (-1, float("-inf"))
-    best: tuple[int, bool, bool, float, float, Polygon, Polygon, int, int, float, str] | None = None
+    best: Optional[
+        tuple[int, bool, bool, float, float, Polygon, Polygon, int, int, float, str]
+    ] = None
     for key, payload in results:
         if key > best_key:
             best_key = key
@@ -1545,7 +1560,7 @@ def best_orientation_and_cell_compact(
     """
     best_n = -1
     best_area = float("inf")
-    best: tuple[int, bool, bool, float, float, Polygon, int, int] | None = None
+    best: Optional[tuple[int, bool, bool, float, float, Polygon, int, int]] = None
 
     for deg in (0, 180):
         for mx in (False, True):
@@ -1581,7 +1596,7 @@ def best_orientation_and_cell_brick(
     """
     best_n = -1
     best_area = float("inf")
-    best: tuple[int, bool, bool, float, float, Polygon, int, int, float] | None = None
+    best: Optional[tuple[int, bool, bool, float, float, Polygon, int, int, float]] = None
     lr = _BRICK_LATTICE_RADIUS
 
     for deg in _BRICK_ROTATIONS:
