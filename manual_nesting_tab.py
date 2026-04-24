@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Optional
 
 import dxf_outline as dx
-from shapely.affinity import rotate, translate
+from shapely.affinity import rotate, scale, translate
 from shapely.geometry import Point, box
 from shapely.geometry.base import BaseGeometry
 
@@ -53,6 +53,8 @@ class PlacedInstance:
     rot: int  # 0,90,180,270 — 绕质心顺时针累计（与 Shapely rotate(..., -rot) 一致）
     cx: float
     cy: float
+    # 质心对齐后、旋转前：相对自身 X 轴镜像（左右翻转）
+    flip_h: bool = False
 
 
 class ManualNestingTab(ttk.Frame):
@@ -88,6 +90,7 @@ class ManualNestingTab(ttk.Frame):
         self._mode = "idle"
         self._ghost_src: Optional[int] = None
         self._ghost_rot = 0
+        self._ghost_flip_h = False
         self._ghost_cx = 0.0
         self._ghost_cy = 0.0
         self._move_anchor_id: Optional[int] = None
@@ -119,6 +122,7 @@ class ManualNestingTab(ttk.Frame):
             self._canvas.bind("<ButtonRelease-1>", self._on_b1_release)
             self._canvas.bind("<ButtonPress-3>", self._on_b3_press)
             self._canvas.bind("<Double-Button-1>", self._on_double_b1)
+            self._canvas.bind("<Key>", self._on_canvas_key)
             self.winfo_toplevel().bind(
                 "<Escape>", self._on_escape_toplevel, add="+"
             )
@@ -149,7 +153,7 @@ class ManualNestingTab(ttk.Frame):
         )
         ttk.Label(
             top_bar,
-            text="双击缩略图放置（虚影在有效区内）；框选后双击其一可整体移动；右键 90°；Esc 取消；Delete 删除选中；板料宽高失焦生效；长按拖动复制阵列。",
+            text="双击缩略图放置（虚影在有效区内）；框选后双击其一可整体移动；右键或 R 顺时针 90°；T 左右翻转；Esc 取消；Delete 删除选中；板料宽高失焦生效；长按拖动复制阵列。",
             foreground="#444",
         ).pack(side="left")
 
@@ -263,6 +267,7 @@ class ManualNestingTab(ttk.Frame):
     def _exit_ghost_placement(self, *, reset_mode: bool) -> None:
         self._ghost_src = None
         self._ghost_rot = 0
+        self._ghost_flip_h = False
         self._move_anchor_id = None
         self._move_ids.clear()
         self._move_dx.clear()
@@ -332,13 +337,32 @@ class ManualNestingTab(ttk.Frame):
             return box(0, 0, max(sw, 1), max(sh, 1))
         return box(ge, ge, sw - ge, sh - ge)
 
+    def _shape_poly_world(
+        self,
+        src_idx: int,
+        rot_deg: int,
+        cx: float,
+        cy: float,
+        flip_h: bool,
+    ) -> Any:
+        """质心对齐后的轮廓：可选左右翻转 → 绕质心平移为 0 的点旋转 → 平移到 (cx,cy)。"""
+        p0 = self._shapes[src_idx].poly_at_centroid
+        if flip_h:
+            p0 = scale(p0, xfact=-1.0, yfact=1.0, origin=(0.0, 0.0))
+        pr = rotate(p0, -float(rot_deg % 360), origin=(0.0, 0.0))
+        return translate(pr, xoff=cx, yoff=cy)
+
     def _world_poly(self, ins: PlacedInstance) -> Any:
-        p0 = self._shapes[ins.src_idx].poly_at_centroid
-        pr = rotate(p0, -float(ins.rot % 360), origin=(0.0, 0.0))
-        return translate(pr, xoff=ins.cx, yoff=ins.cy)
+        return self._shape_poly_world(
+            ins.src_idx,
+            int(ins.rot % 360),
+            float(ins.cx),
+            float(ins.cy),
+            bool(ins.flip_h),
+        )
 
     def _placement_matrix_44(self, ins: PlacedInstance) -> Any:
-        """与 _world_poly 一致的平面刚体变换（绕轮廓质心旋转 + 平移到放置中心）。"""
+        """与 _world_poly 一致的平面变换（可选镜像、绕轮廓质心旋转、平移到放置中心）。"""
         from ezdxf.math import Matrix44
 
         sh = self._shapes[ins.src_idx]
@@ -347,18 +371,33 @@ class ManualNestingTab(ttk.Frame):
         scx, scy = float(sh.src_cx), float(sh.src_cy)
         tx = float(ins.cx) - c * scx - s * scy
         ty = float(ins.cy) + s * scx - c * scy
-        return Matrix44.from_2d_transformation([c, -s, s, c, tx, ty])
+        m_place = Matrix44.from_2d_transformation([c, -s, s, c, tx, ty])
+        if not ins.flip_h:
+            return m_place
+        # 源坐标系内关于竖线 x=src_cx 左右镜像，再施加原放置矩阵（与 Shapely 先 scale 再 rotate 一致）
+        s_x = Matrix44.from_2d_transformation(
+            [-1.0, 0.0, 0.0, 1.0, 2.0 * scx, 0.0]
+        )
+        return Matrix44.chain(s_x, m_place)
 
-    def _export_add_outline_polylines(self, msp: Any, ins: PlacedInstance) -> None:
+    def _export_add_outline_polylines(
+        self, msp: Any, ins: PlacedInstance, sheet_h: float
+    ) -> None:
+        """轮廓折线导出；y 转为 CAD 常用 Y 向上（与画布 Y 向下相反）。"""
         wp = self._world_poly(ins)
         if not getattr(wp, "exterior", None):
             return
+        sh = float(sheet_h)
+
+        def _pt(x: float, y: float) -> tuple[float, float]:
+            return (float(x), sh - float(y))
+
         ext = list(wp.exterior.coords)
         if len(ext) < 3:
             return
         if ext[0] == ext[-1]:
             ext = ext[:-1]
-        pts = [(float(x), float(y)) for x, y in ext]
+        pts = [_pt(x, y) for x, y in ext]
         msp.add_lwpolyline(pts, dxfattribs={"layer": "PARTS"}, close=True)
         for intr in getattr(wp, "interiors", []) or []:
             ir = list(intr.coords)
@@ -366,70 +405,134 @@ class ManualNestingTab(ttk.Frame):
                 continue
             if ir[0] == ir[-1]:
                 ir = ir[:-1]
-            ipt = [(float(x), float(y)) for x, y in ir]
+            ipt = [_pt(x, y) for x, y in ir]
             msp.add_lwpolyline(ipt, dxfattribs={"layer": "PARTS"}, close=True)
 
-    def _export_ensure_layer(
-        self, doc: Any, src_doc: Any, layer_name: str
-    ) -> None:
-        if layer_name in doc.layers:
+    def _export_apply_cad_y_up(self, entity: Any, sheet_h: float) -> None:
+        """程序内为画布 Y 向下；DXF 为 Y 向上：y_cad = sh - y。圆/弧避免用矩阵 Y 缩放（ezdxf 易错），单独处理。"""
+        from ezdxf.math import Matrix44
+        from ezdxf.path import make_path
+
+        sh = float(sheet_h)
+        m_flip = Matrix44.from_2d_transformation([1.0, 0.0, 0.0, -1.0, 0.0, sh])
+        dt = entity.dxftype()
+        if dt == "CIRCLE":
+            c = entity.dxf.center
+            entity.dxf.center = (float(c.x), sh - float(c.y), float(c.z))
             return
-        if layer_name in src_doc.layers:
-            sl = src_doc.layers.get(layer_name)
-            doc.layers.add(
-                layer_name,
-                color=int(sl.color),
-                linetype=sl.dxf.linetype,
-            )
-        else:
-            doc.layers.add(layer_name, color=5)
+        if dt == "ARC":
+            try:
+                path = make_path(entity)
+                pts: list[tuple[float, float]] = []
+                for sub in path.sub_paths():
+                    for v in sub.flattening(0.12):
+                        pts.append((float(v.x), sh - float(v.y)))
+                if len(pts) < 2:
+                    raise ValueError("arc flatten")
+                lay = entity.doc.modelspace()
+                layer = entity.dxf.layer
+                lay.delete_entity(entity)
+                lay.add_lwpolyline(
+                    pts, dxfattribs={"layer": layer}, close=False
+                )
+            except Exception:
+                try:
+                    c = entity.dxf.center
+                    entity.dxf.center = (
+                        float(c.x),
+                        sh - float(c.y),
+                        float(c.z),
+                    )
+                except Exception:
+                    pass
+            return
+        try:
+            entity.transform(m_flip)
+        except Exception:
+            pass
 
     def _export_try_add_native_modelspace(
-        self, doc: Any, msp: Any, ins: PlacedInstance, src_doc: Any
+        self, doc: Any, msp: Any, ins: PlacedInstance, src_doc: Any, sheet_h: float
     ) -> bool:
-        """将源文件模型空间中的几何实体变换后写入目标图；失败返回 False。"""
+        """将源文件模型空间中的几何实体变换后写入目标图；失败返回 False。
+
+        必须用 Importer：直接 copy+add 不会带入块定义，多个源里同名块或 INSERT
+        零件会全部指向目标图中同一个（或无效）块，表现为导出只有一种图形。
+        """
         import ezdxf
+        from ezdxf.addons.importer import Importer
+        from ezdxf.lldxf import const as ezdxf_const
 
         m44 = self._placement_matrix_44(ins)
-        shape = self._shapes[ins.src_idx]
         added = 0
         try:
+            # 每次放置单独 Importer，块名冲突映射不会串到其它源文件
+            importer = Importer(src_doc, doc)
             for entity in src_doc.modelspace():
                 if not entity.is_alive or getattr(entity, "is_virtual", False):
                     continue
                 if not isinstance(entity, ezdxf.entities.DXFGraphic):
                     continue
+                if entity.dxftype() == "VIEWPORT":
+                    continue
+                pre_ids = {id(e) for e in msp}
                 try:
-                    self._export_ensure_layer(doc, src_doc, entity.dxf.layer)
-                    ne = entity.copy()
-                    ne.transform(m44)
-                    msp.add_entity(ne)
-                    added += 1
-                except (ezdxf.DXFError, ezdxf.DXFStructureError, ValueError, TypeError):
+                    importer.import_entity(entity, target_layout=msp)
+                except (
+                    ezdxf.DXFError,
+                    ezdxf.DXFStructureError,
+                    ezdxf_const.DXFTypeError,
+                    ValueError,
+                    TypeError,
+                ):
                     continue
                 except Exception:
                     continue
+                for e in msp:
+                    if id(e) not in pre_ids:
+                        try:
+                            e.transform(m44)
+                            self._export_apply_cad_y_up(e, sheet_h)
+                            added += 1
+                        except Exception:
+                            continue
+            importer.finalize()
         except Exception:
             return False
         return added > 0
 
-    def _ghost_poly_at(self, src_idx: int, rot_deg: int, cx: float, cy: float) -> Any:
-        p0 = self._shapes[src_idx].poly_at_centroid
-        pr = rotate(p0, -float(rot_deg % 360), origin=(0.0, 0.0))
-        return translate(pr, xoff=cx, yoff=cy)
+    def _ghost_poly_at(
+        self,
+        src_idx: int,
+        rot_deg: int,
+        cx: float,
+        cy: float,
+        flip_h: bool = False,
+    ) -> Any:
+        return self._shape_poly_world(
+            int(src_idx), int(rot_deg % 360), float(cx), float(cy), bool(flip_h)
+        )
 
     def _ghost_world_poly(self) -> Optional[Any]:
         if self._ghost_src is None:
             return None
         return self._ghost_poly_at(
-            self._ghost_src, int(self._ghost_rot), self._ghost_cx, self._ghost_cy
+            self._ghost_src,
+            int(self._ghost_rot),
+            self._ghost_cx,
+            self._ghost_cy,
+            self._ghost_flip_h,
         )
 
     def _palette_ghost_ok_at(self, cx: float, cy: float) -> bool:
         if self._ghost_src is None:
             return False
         gh = self._ghost_poly_at(
-            int(self._ghost_src), int(self._ghost_rot), cx, cy
+            int(self._ghost_src),
+            int(self._ghost_rot),
+            cx,
+            cy,
+            self._ghost_flip_h,
         )
         gp, _ge, _sw, _sh = self._nums()
         inner = self._inner_poly()
@@ -478,7 +581,9 @@ class ManualNestingTab(ttk.Frame):
         eff = (self._move_initial_rots[pid] + int(self._ghost_rot)) % 360
         cx = anchor_cx + float(self._move_dx[pid])
         cy = anchor_cy + float(self._move_dy[pid])
-        return self._ghost_poly_at(ins.src_idx, eff, cx, cy)
+        return self._ghost_poly_at(
+            ins.src_idx, eff, cx, cy, bool(ins.flip_h)
+        )
 
     def _move_group_fully_valid(self, anchor_cx: float, anchor_cy: float) -> bool:
         inner = self._inner_poly()
@@ -614,6 +719,28 @@ class ManualNestingTab(ttk.Frame):
         ttk.Button(bt, text="取消", command=cancel).pack(side="right")
         dlg.grab_set()
 
+    def _suggested_layout_export_filename(self) -> str:
+        """按当前排样用到的零件源文件名（去重、去扩展名）组合默认保存名。"""
+        seen: set[int] = set()
+        names: list[str] = []
+        for ins in self._placed:
+            if ins.src_idx in seen:
+                continue
+            seen.add(ins.src_idx)
+            if 0 <= ins.src_idx < len(self._shapes):
+                base = os.path.splitext(self._shapes[ins.src_idx].name)[0].strip()
+                if base:
+                    names.append(base)
+        if not names:
+            raw = "手动排样"
+        else:
+            raw = "+".join(names) + "手动排样"
+        safe = "".join("_" if c in '<>:"/\\|?*\n\r\t' else c for c in raw)
+        safe = safe.strip(" .+_") or "手动排样"
+        if len(safe) > 120:
+            safe = safe[:120].rstrip(" .+_") + "等"
+        return f"{safe}.dxf"
+
     def _save_layout_dxf(self) -> None:
         if not dx.deps_available():
             return
@@ -628,7 +755,7 @@ class ManualNestingTab(ttk.Frame):
             title="保存排样为 DXF",
             defaultextension=".dxf",
             filetypes=[("DXF 图纸", "*.dxf"), ("所有文件", "*.*")],
-            initialfile="手动排样.dxf",
+            initialfile=self._suggested_layout_export_filename(),
         )
         if not path:
             return
@@ -648,21 +775,9 @@ class ManualNestingTab(ttk.Frame):
                 doc.units = ezdxf_units.MM
             except (AttributeError, TypeError, ValueError):
                 doc.header["$INSUNITS"] = 4
-            doc.layers.add("SHEET", color=8)
             doc.layers.add("PARTS", color=5)
             msp = doc.modelspace()
             _gp, _ge, sw, sh = self._nums()
-            sheet_ring = [
-                (0.0, 0.0),
-                (float(sw), 0.0),
-                (float(sw), float(sh)),
-                (0.0, float(sh)),
-            ]
-            msp.add_lwpolyline(
-                sheet_ring,
-                dxfattribs={"layer": "SHEET"},
-                close=True,
-            )
             src_open: dict[str, Any] = {}
             outline_fallback = 0
             for ins in self._placed:
@@ -674,12 +789,12 @@ class ManualNestingTab(ttk.Frame):
                         if fp not in src_open:
                             src_open[fp] = ezdxf.readfile(fp)
                         ok_native = self._export_try_add_native_modelspace(
-                            doc, msp, ins, src_open[fp]
+                            doc, msp, ins, src_open[fp], sh
                         )
                     except Exception:
                         ok_native = False
                 if not ok_native:
-                    self._export_add_outline_polylines(msp, ins)
+                    self._export_add_outline_polylines(msp, ins, sh)
                     outline_fallback += 1
             doc.saveas(path)
         except Exception as ex:
@@ -690,8 +805,9 @@ class ManualNestingTab(ttk.Frame):
             )
             return
         msg = (
-            f"已导出 {len(self._placed)} 个零件及板料外框（mm）。\n"
+            f"已导出 {len(self._placed)} 个零件（mm）。\n"
             "几何尽量保留源 DXF 中的直线/圆弧/圆等实体（与排样时轮廓变换一致）。\n"
+            "导出已按板料高度将 Y 转为 CAD 常用 Y 向上，与画布排样一致。\n"
         )
         if outline_fallback:
             msg += (
@@ -802,10 +918,15 @@ class ManualNestingTab(ttk.Frame):
         self._mode = "palette_ghost"
         self._ghost_src = src_idx
         self._ghost_rot = 0
+        self._ghost_flip_h = False
         self._selection.clear()
         _gp, ge, sw, sh = self._nums()
         cx, cy = sw / 2.0, sh / 2.0
         self._ghost_cx, self._ghost_cy = self._constrain_palette_ghost(cx, cy)
+        try:
+            self._canvas.focus_set()
+        except tk.TclError:
+            pass
         self._redraw()
 
     def _clear_rubber_and_replica_state(self) -> None:
@@ -838,6 +959,26 @@ class ManualNestingTab(ttk.Frame):
                 self._ghost_cx = mmx
                 self._ghost_cy = mmy
             self._redraw()
+
+    def _on_canvas_key(self, ev: tk.Event) -> Optional[str]:
+        if self._mode != "palette_ghost" or self._ghost_src is None:
+            return None
+        sym = (ev.keysym or "").lower()
+        if sym == "r":
+            self._ghost_rot = (int(self._ghost_rot) + 90) % 360
+            self._ghost_cx, self._ghost_cy = self._constrain_palette_ghost(
+                self._ghost_cx, self._ghost_cy
+            )
+            self._redraw()
+            return "break"
+        if sym == "t":
+            self._ghost_flip_h = not self._ghost_flip_h
+            self._ghost_cx, self._ghost_cy = self._constrain_palette_ghost(
+                self._ghost_cx, self._ghost_cy
+            )
+            self._redraw()
+            return "break"
+        return None
 
     def _on_b3_press(self, ev: tk.Event) -> str:
         if self._mode in ("palette_ghost", "move_one") and (
@@ -946,9 +1087,15 @@ class ManualNestingTab(ttk.Frame):
         for ins in self._placed:
             if ins.id not in self._selection:
                 continue
-            p0 = self._shapes[ins.src_idx].poly_at_centroid
-            pr = rotate(p0, -float(ins.rot % 360), origin=(0.0, 0.0))
-            batch.append(translate(pr, xoff=ins.cx + ox, yoff=ins.cy + oy))
+            batch.append(
+                self._shape_poly_world(
+                    ins.src_idx,
+                    int(ins.rot % 360),
+                    ins.cx + ox,
+                    ins.cy + oy,
+                    bool(ins.flip_h),
+                )
+            )
         return batch
 
     def _replica_batch_valid(
@@ -1190,6 +1337,7 @@ class ManualNestingTab(ttk.Frame):
             rot=self._ghost_rot % 360,
             cx=self._ghost_cx,
             cy=self._ghost_cy,
+            flip_h=bool(self._ghost_flip_h),
         )
         self._next_id += 1
         self._placed.append(ins)
@@ -1204,6 +1352,7 @@ class ManualNestingTab(ttk.Frame):
         self._mode = "idle"
         self._ghost_src = None
         self._ghost_rot = 0
+        self._ghost_flip_h = False
         self._rebuild_thumbs()
         self._redraw()
 
@@ -1230,6 +1379,7 @@ class ManualNestingTab(ttk.Frame):
                     rot=(self._move_initial_rots[p.id] + int(self._ghost_rot)) % 360,
                     cx=acx + self._move_dx[p.id],
                     cy=acy + self._move_dy[p.id],
+                    flip_h=p.flip_h,
                 )
             )
         self._placed = new_placed
@@ -1257,9 +1407,13 @@ class ManualNestingTab(ttk.Frame):
             for ins in self._placed:
                 if ins.id not in self._selection:
                     continue
-                p0 = self._shapes[ins.src_idx].poly_at_centroid
-                pr = rotate(p0, -float(ins.rot % 360), origin=(0.0, 0.0))
-                wp = translate(pr, xoff=ins.cx + ox, yoff=ins.cy + oy)
+                wp = self._shape_poly_world(
+                    ins.src_idx,
+                    int(ins.rot % 360),
+                    ins.cx + ox,
+                    ins.cy + oy,
+                    bool(ins.flip_h),
+                )
                 batch_polys.append(wp)
                 batch_rows.append(
                     PlacedInstance(
@@ -1268,6 +1422,7 @@ class ManualNestingTab(ttk.Frame):
                         rot=ins.rot % 360,
                         cx=ins.cx + ox,
                         cy=ins.cy + oy,
+                        flip_h=ins.flip_h,
                     )
                 )
             ok = True
@@ -1417,9 +1572,13 @@ class ManualNestingTab(ttk.Frame):
             for ins in self._placed:
                 if ins.id not in self._selection:
                     continue
-                p0 = self._shapes[ins.src_idx].poly_at_centroid
-                pr = rotate(p0, -float(ins.rot % 360), origin=(0.0, 0.0))
-                ghost = translate(pr, xoff=ins.cx + ox, yoff=ins.cy + oy)
+                ghost = self._shape_poly_world(
+                    ins.src_idx,
+                    int(ins.rot % 360),
+                    ins.cx + ox,
+                    ins.cy + oy,
+                    bool(ins.flip_h),
+                )
                 self._draw_poly_on_canvas(
                     ghost, fill="", outline="#a060a0", dash=(2, 4)
                 )
