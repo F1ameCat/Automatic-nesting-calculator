@@ -969,16 +969,16 @@ def main() -> None:
     notebook.pack(fill="both", expand=True)
 
     tab_manual = ManualNestingTab(notebook, padding=0)
-    notebook.add(tab_manual, text="手动排样")
-
-    tab_dxf = DxfNestingTab(notebook, padding=0)
-    notebook.add(tab_dxf, text="下料（DXF轮廓）")
+    notebook.add(tab_manual, text="手动排样（适用于多个/异型零件）")
 
     tab_cutting = CuttingCalculatorTab(notebook, padding=0)
-    notebook.add(tab_cutting, text="下料计算器（原型）")
+    notebook.add(tab_cutting, text="自动排样（适用于单个零件）")
+
+    tab_dxf = DxfNestingTab(notebook, padding=0)
+    notebook.add(tab_dxf, text="自动异形排料（巨卡慎用）")
 
     tab_neutral = NeutralLayerFactorTab(notebook, padding=0)
-    notebook.add(tab_neutral, text="中心层因子")
+    notebook.add(tab_neutral, text="中心层因子计算器")
 
     maximize_toplevel(root)
 

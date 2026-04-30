@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Optional
 
 import dxf_outline as dx
@@ -20,7 +21,9 @@ _PICK_TOL_MM = 3.0
 _THUMB_IMPORT_CANVAS = 120
 _THUMB_BAR_CANVAS = 96
 _DRAG_START_PX = 5
-_LONG_PRESS_MS = 100
+_LONG_PRESS_MS = 280
+_LONG_PRESS_RING_RADIUS = 16
+_LONG_PRESS_RING_WIDTH = 4
 
 
 def _gap_ok(p0: BaseGeometry, p1: BaseGeometry, gap_mm: float) -> bool:
@@ -104,6 +107,9 @@ class ManualNestingTab(ttk.Frame):
         self._replica_press_mm: Optional[tuple[float, float]] = None
         self._replica_ghost_offsets: list[tuple[float, float]] = []
         self._long_press_timer: Optional[str] = None
+        self._long_press_progress_job: Optional[str] = None
+        self._long_press_started_at = 0.0
+        self._long_press_canvas: Optional[tuple[float, float]] = None
         self._replica_from_long_press = False
         self._replica_locked_sx: Optional[float] = None
         self._replica_locked_sy: Optional[float] = None
@@ -148,6 +154,9 @@ class ManualNestingTab(ttk.Frame):
         ttk.Button(top_bar, text="导入 DXF…", command=self._import_dxf).pack(
             side="left", padx=(0, 8)
         )
+        ttk.Button(top_bar, text="添加矩形…", command=self._add_rectangle_part).pack(
+            side="left", padx=(0, 8)
+        )
         ttk.Button(top_bar, text="保存排样 DXF…", command=self._save_layout_dxf).pack(
             side="left", padx=(0, 8)
         )
@@ -172,6 +181,16 @@ class ManualNestingTab(ttk.Frame):
         self._add_row(left, "零件与边缘间距", self.var_gap_edge)
         self._add_sheet_commit_row(left, "板料宽", self.var_sheet_w)
         self._add_sheet_commit_row(left, "板料高", self.var_sheet_h)
+        ttk.Button(
+            left,
+            text="板幅缩小至当前零件范围",
+            command=self._shrink_sheet_to_parts_bounds,
+        ).pack(fill="x", pady=(10, 2))
+        ttk.Button(
+            left,
+            text="恢复默认板幅",
+            command=self._reset_sheet_size_default,
+        ).pack(fill="x", pady=(2, 2))
 
         right = ttk.Frame(main)
         right.grid(row=0, column=1, sticky="nsew")
@@ -215,6 +234,72 @@ class ManualNestingTab(ttk.Frame):
         ent.bind("<FocusOut>", apply_sheet, add="+")
         ent.bind("<Return>", apply_sheet, add="+")
 
+    def _shrink_sheet_to_parts_bounds(self) -> None:
+        if not self._placed:
+            messagebox.showinfo(
+                "无零件可缩小板幅",
+                "当前画布没有已放置零件。",
+                parent=self.winfo_toplevel(),
+            )
+            return
+        minx = math.inf
+        miny = math.inf
+        maxx = -math.inf
+        maxy = -math.inf
+        for ins in self._placed:
+            try:
+                b = self._world_poly(ins).bounds
+            except Exception:
+                continue
+            minx = min(minx, float(b[0]))
+            miny = min(miny, float(b[1]))
+            maxx = max(maxx, float(b[2]))
+            maxy = max(maxy, float(b[3]))
+        if not (
+            math.isfinite(minx)
+            and math.isfinite(miny)
+            and math.isfinite(maxx)
+            and math.isfinite(maxy)
+            and maxx > minx
+            and maxy > miny
+        ):
+            messagebox.showerror(
+                "缩小失败",
+                "未能计算零件范围，请检查零件几何。",
+                parent=self.winfo_toplevel(),
+            )
+            return
+
+        _gp, ge, _sw, _sh = self._nums()
+        edge_gap = max(0.0, float(ge))
+        dx_off = minx - edge_gap
+        dy_off = miny - edge_gap
+        new_w = max(1.0, (maxx - minx) + 2.0 * edge_gap)
+        new_h = max(1.0, (maxy - miny) + 2.0 * edge_gap)
+        self._placed = [
+            PlacedInstance(
+                id=p.id,
+                src_idx=p.src_idx,
+                rot=p.rot,
+                cx=float(p.cx) - dx_off,
+                cy=float(p.cy) - dy_off,
+                flip_h=p.flip_h,
+            )
+            for p in self._placed
+        ]
+        self._applied_sheet_w = new_w
+        self._applied_sheet_h = new_h
+        self.var_sheet_w.set(f"{new_w:.3f}".rstrip("0").rstrip("."))
+        self.var_sheet_h.set(f"{new_h:.3f}".rstrip("0").rstrip("."))
+        self._redraw()
+
+    def _reset_sheet_size_default(self) -> None:
+        self._applied_sheet_w = 2000.0
+        self._applied_sheet_h = 1200.0
+        self.var_sheet_w.set("2000")
+        self.var_sheet_h.set("1200")
+        self._redraw()
+
     def _on_delete_all(self, ev: tk.Event) -> Optional[str]:
         if not self._widget_is_under_tab(ev.widget):
             return None
@@ -238,6 +323,9 @@ class ManualNestingTab(ttk.Frame):
         return False
 
     def _on_escape_toplevel(self, ev: tk.Event) -> Optional[str]:
+        # 虚框放置/移动期间：不依赖当前焦点来自哪个控件，ESC 一律可取消
+        if self._mode in ("palette_ghost", "move_one"):
+            return self._on_escape(ev)
         if not self._widget_is_under_tab(ev.widget):
             return None
         return self._on_escape(ev)
@@ -657,6 +745,82 @@ class ManualNestingTab(ttk.Frame):
     def _canvas_to_mm(self, cx: float, cy: float) -> tuple[float, float]:
         return (cx - self._ox) / self._scale, (cy - self._oy) / self._scale
 
+    def _add_rectangle_part(self) -> None:
+        dlg = tk.Toplevel(self.winfo_toplevel())
+        dlg.title("添加矩形零件")
+        dlg.transient(self.winfo_toplevel())
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        var_w = tk.StringVar(value="100")
+        var_h = tk.StringVar(value="100")
+        var_qty = tk.StringVar(value="1")
+
+        for i, (lb, v) in enumerate(
+            (("宽（mm）", var_w), ("高（mm）", var_h), ("库存", var_qty))
+        ):
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=4)
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=f"{lb}：", width=12, anchor="w").grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Entry(row, textvariable=v, width=14).grid(row=0, column=1, sticky="ew")
+
+        def ok() -> None:
+            try:
+                w = float(var_w.get().strip() or "0")
+                h = float(var_h.get().strip() or "0")
+                q = max(0, int(float(var_qty.get().strip() or "0")))
+            except (TypeError, ValueError):
+                messagebox.showerror(
+                    "输入无效",
+                    "请填写有效数字：宽、高需大于 0，库存需为非负整数。",
+                    parent=dlg,
+                )
+                return
+            if w <= 0 or h <= 0:
+                messagebox.showerror(
+                    "输入无效",
+                    "矩形宽和高必须大于 0。",
+                    parent=dlg,
+                )
+                return
+            base_name = f"矩形_{w:g}x{h:g}"
+            existed = {s.name for s in self._shapes}
+            name = base_name
+            idx = 2
+            while name in existed:
+                name = f"{base_name}_{idx}"
+                idx += 1
+            poly = box(0.0, 0.0, float(w), float(h))
+            c = poly.centroid
+            sx, sy = float(c.x), float(c.y)
+            poly_c = translate(poly, xoff=-sx, yoff=-sy)
+            self._shapes.append(
+                ImportedShape(
+                    path="",
+                    name=name,
+                    poly_at_centroid=poly_c,
+                    src_cx=sx,
+                    src_cy=sy,
+                    inventory=q,
+                    placed_count=0,
+                )
+            )
+            dlg.destroy()
+            self._rebuild_thumbs()
+            self._redraw()
+
+        def cancel() -> None:
+            dlg.destroy()
+
+        bt = ttk.Frame(frm)
+        bt.pack(fill="x", pady=(10, 0))
+        ttk.Button(bt, text="确定", command=ok).pack(side="left")
+        ttk.Button(bt, text="取消", command=cancel).pack(side="right")
+        dlg.grab_set()
+
     def _import_dxf(self) -> None:
         paths = filedialog.askopenfilenames(
             title="选择 DXF（可多选）",
@@ -858,12 +1022,105 @@ class ManualNestingTab(ttk.Frame):
             )
             cv.pack()
             self._draw_thumb(cv, sh.poly_at_centroid, size=_THUMB_BAR_CANVAS)
-            ttk.Label(wrap, text=f"{sh.name[:18]}", font=("Segoe UI", 8)).pack()
-            ttk.Label(
+            lbl_name = ttk.Label(wrap, text=f"{sh.name[:18]}", font=("Segoe UI", 8))
+            lbl_name.pack()
+            lbl_inv = ttk.Label(
                 wrap, text=f"库存 {sh.inventory} / 已放 {sh.placed_count}", font=("Segoe UI", 7)
-            ).pack()
+            )
+            lbl_inv.pack()
             cv.bind("<Double-Button-1>", lambda _e, idx=i: self._start_palette_ghost(idx))
             wrap.bind("<Double-Button-1>", lambda _e, idx=i: self._start_palette_ghost(idx))
+            for w in (wrap, cv, lbl_name, lbl_inv):
+                w.bind(
+                    "<Button-3>",
+                    lambda ev, idx=i: self._show_thumb_context_menu(ev, idx),
+                )
+
+    def _show_thumb_context_menu(self, ev: tk.Event, idx: int) -> None:
+        if not (0 <= idx < len(self._shapes)):
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="重命名", command=lambda i=idx: self._rename_shape(i))
+        menu.add_command(label="修改库存", command=lambda i=idx: self._change_shape_inventory(i))
+        menu.add_separator()
+        menu.add_command(label="删除", command=lambda i=idx: self._delete_shape(i))
+        try:
+            menu.tk_popup(int(ev.x_root), int(ev.y_root))
+        finally:
+            menu.grab_release()
+
+    def _rename_shape(self, idx: int) -> None:
+        if not (0 <= idx < len(self._shapes)):
+            return
+        sh = self._shapes[idx]
+        new_name = simpledialog.askstring(
+            "重命名零件",
+            "请输入新的零件名称：",
+            initialvalue=sh.name,
+            parent=self.winfo_toplevel(),
+        )
+        if new_name is None:
+            return
+        name = new_name.strip()
+        if not name:
+            messagebox.showerror("输入无效", "零件名称不能为空。", parent=self.winfo_toplevel())
+            return
+        sh.name = name
+        self._rebuild_thumbs()
+        self._redraw()
+
+    def _change_shape_inventory(self, idx: int) -> None:
+        if not (0 <= idx < len(self._shapes)):
+            return
+        sh = self._shapes[idx]
+        val = simpledialog.askinteger(
+            "修改库存",
+            f"请输入「{sh.name}」的新库存（>=0）：",
+            initialvalue=int(sh.inventory),
+            minvalue=0,
+            parent=self.winfo_toplevel(),
+        )
+        if val is None:
+            return
+        sh.inventory = int(max(0, val))
+        self._rebuild_thumbs()
+        self._redraw()
+
+    def _delete_shape(self, idx: int) -> None:
+        if not (0 <= idx < len(self._shapes)):
+            return
+        sh = self._shapes[idx]
+        remove_ids = {p.id for p in self._placed if p.src_idx == idx}
+        placed_n = len(remove_ids)
+        msg = f"确定删除零件「{sh.name}」吗？"
+        if placed_n:
+            msg += f"\n这会同时删除画布中已放置的 {placed_n} 件。"
+        if not messagebox.askyesno("删除零件", msg, parent=self.winfo_toplevel()):
+            return
+        self._exit_ghost_placement(reset_mode=True)
+        self._shapes.pop(idx)
+        if remove_ids:
+            self._placed = [p for p in self._placed if p.id not in remove_ids]
+            self._selection.difference_update(remove_ids)
+        new_placed: list[PlacedInstance] = []
+        for p in self._placed:
+            if p.src_idx > idx:
+                new_placed.append(
+                    PlacedInstance(
+                        id=p.id,
+                        src_idx=p.src_idx - 1,
+                        rot=p.rot,
+                        cx=p.cx,
+                        cy=p.cy,
+                        flip_h=p.flip_h,
+                    )
+                )
+            else:
+                new_placed.append(p)
+        self._placed = new_placed
+        self._recount_placed_by_src()
+        self._rebuild_thumbs()
+        self._redraw()
 
     @staticmethod
     def _draw_thumb(cv: tk.Canvas, poly_at_c: Any, size: int = 72) -> None:
@@ -946,6 +1203,27 @@ class ManualNestingTab(ttk.Frame):
             except tk.TclError:
                 pass
             self._long_press_timer = None
+        if self._long_press_progress_job is not None:
+            try:
+                self.after_cancel(self._long_press_progress_job)
+            except tk.TclError:
+                pass
+            self._long_press_progress_job = None
+        self._long_press_started_at = 0.0
+        self._long_press_canvas = None
+
+    def _start_long_press_progress(self) -> None:
+        if self._long_press_progress_job is not None:
+            return
+
+        def tick() -> None:
+            self._long_press_progress_job = None
+            if self._long_press_timer is None or self._replica_press_mm is None:
+                return
+            self._redraw()
+            self._long_press_progress_job = self.after(16, tick)
+
+        self._long_press_progress_job = self.after(16, tick)
 
     def _on_motion(self, ev: tk.Event) -> None:
         mmx, mmy = self._canvas_to_mm(float(ev.x), float(ev.y))
@@ -1071,6 +1349,8 @@ class ManualNestingTab(ttk.Frame):
     def _schedule_long_press(self) -> None:
         self._cancel_long_press_timer()
         self._replica_from_long_press = False
+        self._long_press_started_at = time.monotonic()
+        self._long_press_canvas = self._press_canvas
 
         def fire() -> None:
             self._long_press_timer = None
@@ -1079,8 +1359,12 @@ class ManualNestingTab(ttk.Frame):
             if self._replica_press_mm is None:
                 return
             self._replica_from_long_press = True
+            self._long_press_progress_job = None
+            self._long_press_canvas = None
+            self._redraw()
 
         self._long_press_timer = self.after(_LONG_PRESS_MS, fire)
+        self._start_long_press_progress()
 
     def _replica_batch_polys_at(self, ox: float, oy: float) -> list[Any]:
         batch: list[Any] = []
@@ -1146,6 +1430,10 @@ class ManualNestingTab(ttk.Frame):
 
         if self._long_press_timer is not None and dist > 10:
             self._cancel_long_press_timer()
+            self._redraw()
+        elif self._long_press_timer is not None:
+            self._long_press_canvas = (float(ev.x), float(ev.y))
+            self._redraw()
 
         if self._mode == "replica_drag":
             mmx, mmy = self._canvas_to_mm(float(ev.x), float(ev.y))
@@ -1322,6 +1610,7 @@ class ManualNestingTab(ttk.Frame):
         self._press_canvas = None
         self._replica_press_mm = None
         self._replica_from_long_press = False
+        self._redraw()
 
     def _try_place_ghost(self) -> None:
         gh = self._ghost_world_poly()
@@ -1502,6 +1791,34 @@ class ManualNestingTab(ttk.Frame):
                     *hi, fill="#f7f7f7", outline=outline, width=1, dash=dash
                 )
 
+    def _draw_long_press_progress(self) -> None:
+        if self._long_press_timer is None or self._long_press_canvas is None:
+            return
+        elapsed_ms = (time.monotonic() - float(self._long_press_started_at)) * 1000.0
+        progress = max(0.0, min(1.0, elapsed_ms / float(max(1, _LONG_PRESS_MS))))
+        cx, cy = self._long_press_canvas
+        r = float(_LONG_PRESS_RING_RADIUS)
+        w = int(_LONG_PRESS_RING_WIDTH)
+        self._canvas.create_oval(
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
+            outline="#9a9a9a",
+            width=w,
+        )
+        self._canvas.create_arc(
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
+            start=90,
+            extent=-360.0 * progress,
+            style="arc",
+            outline="#2d7cf7",
+            width=w,
+        )
+
     def _redraw(self) -> None:
         if not dx.deps_available():
             return
@@ -1588,6 +1905,7 @@ class ManualNestingTab(ttk.Frame):
             self._canvas.create_rectangle(
                 x0, y0, x1, y1, outline="#0066cc", width=1, dash=(3, 2)
             )
+        self._draw_long_press_progress()
 
         self._canvas.create_text(
             self._ox + draw_w / 2,
